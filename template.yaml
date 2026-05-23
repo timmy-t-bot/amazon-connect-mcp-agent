@@ -133,7 +133,6 @@ Resources:
   ConnectPhoneNumber:
     Condition: ClaimPhoneNumber
     Type: AWS::Connect::PhoneNumber
-    DependsOn: ConnectContactFlow
     Properties:
       InstanceId: !Ref ConnectInstanceId
       PhoneNumberType: DID
@@ -203,7 +202,7 @@ Resources:
           CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
           CONNECT_CONTACT_FLOW_ID: !If
             - CreateContactFlow
-            - !GetAtt ConnectContactFlow.ContactFlowId
+            - !Ref ConnectContactFlow
             - !Ref ConnectContactFlowId
           SOURCE_PHONE_NUMBER: !If
             - ClaimPhoneNumber
@@ -337,7 +336,7 @@ Outputs:
       Auto-generated if not provided.
     Value: !If
       - CreateContactFlow
-      - !GetAtt ConnectContactFlow.ContactFlowId
+      - !Ref ConnectContactFlow
       - !Ref ConnectContactFlowId
   SourcePhoneNumber:
     Description: >
