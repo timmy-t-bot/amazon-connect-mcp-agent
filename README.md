@@ -50,8 +50,8 @@ By using **Amazon Bedrock AgentCore Gateway**, we expose AWS actions as standard
 ## 3. Prerequisites
 
 - An AWS Account.
-- An **Amazon Connect Instance** with a claimed phone number enabled for outbound calls.
-- IAM permissions to create Lambda functions and AgentCore Gateway resources.
+- An **Amazon Connect Instance** (you only need the Instance ID; the template handles the rest).
+- IAM permissions to create Lambda, DynamoDB, SNS, and Connect resources.
 - The [AWS AgentCore CLI](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-quick-start.html) installed:
   ```bash
   npm install -g @aws/agentcore
@@ -61,81 +61,62 @@ By using **Amazon Bedrock AgentCore Gateway**, we expose AWS actions as standard
 
 ## 4. Step-by-Step Setup
 
-### Step 1: Configure the Amazon Connect Contact Flow
+### Step 1: Deploy the CloudFormation Template
 
-Create a simple contact flow in your Amazon Connect instance to handle outbound reminder calls.
+The template automatically provisions the backend and can optionally create a Connect Contact Flow and claim a phone number for you.
 
-1. In the Amazon Connect admin console, go to **Routing > Contact Flows**.
-2. Create a new contact flow (type: **Outbound**).
-3. Add the following blocks:
-   - **Set voice** (optional): Set to your preferred language and voice.
-   - **Play prompt**:
-     - Select **Text-to-speech**.
-     - Enter the attribute: `$.Attributes.ReminderMessage`
-     - *This tells Polly to speak the message passed by the Lambda.*
-   - **Disconnect / hang up**.
-4. Save and publish the flow. Copy the **Contact Flow ID** (found in the ARN).
+**Option A: Fully Automated (Recommended for New Projects)**
 
-### Step 2: Create the Lambda Function
+Provide only your Connect Instance ID. The template will create a simple outbound reminder flow and claim a DID phone number.
 
-Create a Python 3.12 Lambda function named `connect-outbound-caller`.
-
-**Environment Variables:**
-| Variable | Description |
-|----------|-------------|
-| `CONNECT_INSTANCE_ID` | Your Amazon Connect instance ID. |
-| `CONNECT_CONTACT_FLOW_ID` | The ID of the contact flow created in Step 1. |
-| `SOURCE_PHONE_NUMBER` | Your claimed Amazon Connect outbound number (E.164 format). |
-
-**IAM Role Permissions:**
-- `connect:StartOutboundContact`
-- Standard CloudWatch Logs permissions (`logs:CreateLogGroup`, `logs:CreateLogStream`, `logs:PutLogEvents`)
-
-**Lambda Code:**
-```python
-import boto3
-import os
-import json
-
-connect = boto3.client('connect')
-
-def lambda_handler(event, context):
-    # AgentCore Gateway maps MCP tool arguments into the event payload.
-    args = event.get('arguments', {})
-    phone = args.get('phone_number')
-    message = args.get('message')
-
-    if not phone or not message:
-        return {
-            'statusCode': 400,
-            'body': json.dumps({'error': 'Missing phone_number or message'})
-        }
-
-    try:
-        response = connect.start_outbound_contact(
-            DestinationPhoneNumber=phone,
-            ContactFlowId=os.environ['CONNECT_CONTACT_FLOW_ID'],
-            InstanceId=os.environ['CONNECT_INSTANCE_ID'],
-            SourcePhoneNumber=os.environ['SOURCE_PHONE_NUMBER'],
-            Attributes={'ReminderMessage': message}
-        )
-
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'contact_id': response['ContactId'],
-                'status': 'dialing',
-                'message': f"Reminder call initiated to {phone}"
-            })
-        }
-    except Exception as e:
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
+```bash
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name connect-mcp-agent \
+  --parameter-overrides \
+    ConnectInstanceId=your-instance-id \
+    Environment=dev \
+  --capabilities CAPABILITY_NAMED_IAM
 ```
 
-### Step 3: Deploy AgentCore Gateway
+**Option B: Use Existing Flow and Number**
+
+If you already have an outbound contact flow and a claimed phone number:
+
+```bash
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name connect-mcp-agent \
+  --parameter-overrides \
+    ConnectInstanceId=your-instance-id \
+    ConnectContactFlowId=your-flow-id \
+    SourcePhoneNumber=+15551234567 \
+    Environment=dev \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+**What the template deploys:**
+
+| Resource | Purpose |
+|----------|---------|
+| **Lambda Function** (`connect-outbound-caller`) | Handles `place_outbound_call`, `send_sms`, and `log` actions. |
+| **IAM Role** | Grants least-privilege access to Connect, DynamoDB, SNS, and CloudWatch Logs. |
+| **DynamoDB Table** (`connect-mcp-logs`) | Stores call/SMS logs with a 30-day TTL for automatic cleanup. |
+| **SNS Topic** | Backend for SMS reminders. |
+| **Contact Flow** (optional) | A pre-built outbound flow that speaks `$.Attributes.ReminderMessage` via Polly. |
+| **Phone Number** (optional) | A claimed DID associated with the outbound flow. |
+
+After deployment, grab the outputs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name connect-mcp-agent \
+  --query 'Stacks[0].Outputs'
+```
+
+You will need the **LambdaArn**, **ContactFlowId**, and **SourcePhoneNumber** for the next step.
+
+### Step 2: Deploy AgentCore Gateway
 
 1. **Initialize the project:**
    ```bash
@@ -173,6 +154,24 @@ def lambda_handler(event, context):
            },
            "required": ["phone_number", "message"]
          }
+       },
+       {
+         "name": "send_sms",
+         "description": "Sends an SMS reminder via Amazon SNS.",
+         "inputSchema": {
+           "type": "object",
+           "properties": {
+             "phone_number": {
+               "type": "string",
+               "description": "E.164 formatted phone number, e.g. +15551234567"
+             },
+             "message": {
+               "type": "string",
+               "description": "The SMS message to send."
+             }
+           },
+           "required": ["phone_number", "message"]
+         }
        }
      ]
    }
@@ -183,7 +182,7 @@ def lambda_handler(event, context):
    agentcore add gateway-target \
      --name OutboundCallTool \
      --type lambda-function-arn \
-     --lambda-arn arn:aws:lambda:REGION:ACCOUNT:function:connect-outbound-caller \
+     --lambda-arn <LAMBDA_ARN_FROM_STACK_OUTPUTS> \
      --tool-schema-file tools.json \
      --gateway ConnectGateway
    ```
@@ -195,7 +194,7 @@ def lambda_handler(event, context):
 
 6. **Copy the Gateway MCP endpoint URL** from the deployment output. You will need this to configure your AI agent.
 
-### Step 4: Connect Your AI Agent
+### Step 3: Connect Your AI Agent
 
 Configure your MCP client to use the Gateway endpoint. The example below is for **Claude Desktop** (`claude_desktop_config.json`). Adapt the connection method based on the specific MCP SDK or client you are using.
 
@@ -266,7 +265,7 @@ Because AgentCore Gateway aggregates all targets into a single MCP endpoint, you
 - **Production:** Switch to `IAM` (SigV4) or `OAuth` (JWT) before deploying to production. Gateway manages both inbound and outbound credential exchange.
 
 ### Input Validation
-- The Lambda should validate that `phone_number` is in strict **E.164 format** (`+` followed by country code and number) to prevent dial errors.
+- The Lambda validates that `phone_number` is in strict **E.164 format** (`+` followed by country code and number) to prevent dial errors.
 - Add a message length check to avoid excessive Polly usage or TTS costs.
 
 ### Rate Limiting & Cost Control
@@ -275,7 +274,7 @@ Because AgentCore Gateway aggregates all targets into a single MCP endpoint, you
 - Enable **CloudTrail** for AgentCore Gateway and **CloudWatch Logs** for Lambda to audit every tool invocation.
 
 ### Data Retention
-- If you log calls to DynamoDB, set a **Time-To-Live (TTL)** attribute to auto-expire old records and keep costs low.
+- Call logs in DynamoDB auto-expire after 30 days via TTL.
 
 ---
 
@@ -287,6 +286,8 @@ Because AgentCore Gateway aggregates all targets into a single MCP endpoint, you
 | **Amazon Polly** | TTS characters spoken | ~$4.00 per 1M characters |
 | **AgentCore Gateway** | Per-request pricing | See [AWS Pricing](https://aws.amazon.com/bedrock/pricing/) |
 | **AWS Lambda** | Requests & compute | Usually within free tier for low volume |
+| **DynamoDB** | On-demand writes | Negligible for low volume |
+| **SNS SMS** | Per-message | ~$0.0075 / SMS (US) |
 
 ---
 

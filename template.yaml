@@ -1,20 +1,44 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Amazon Connect MCP Agent - Backend Infrastructure.
-  Deploys a Lambda function, DynamoDB call log table, SNS topic, and IAM role.
+  Deploys a Lambda function, DynamoDB call log table, SNS topic, and optionally
+  an Amazon Connect Outbound Contact Flow and claimed phone number.
   After deployment, use the Lambda ARN with AgentCore Gateway to expose these
   actions as MCP tools to your AI agent.
 
 Parameters:
   ConnectInstanceId:
     Type: String
-    Description: Your existing Amazon Connect Instance ID (e.g., 12345678-1234-1234-1234-123456789012)
+    Description: >
+      Your existing Amazon Connect Instance ID
+      (e.g., 12345678-1234-1234-1234-123456789012)
   ConnectContactFlowId:
     Type: String
-    Description: The Outbound Contact Flow ID (UUID from the ARN)
+    Default: ''
+    Description: >
+      Existing Outbound Contact Flow ID (UUID from the ARN).
+      Leave blank to auto-create a simple reminder flow.
   SourcePhoneNumber:
     Type: String
-    Description: Your claimed Amazon Connect outbound number in E.164 format (e.g., +15551234567)
+    Default: ''
+    Description: >
+      Your claimed Amazon Connect outbound number in E.164 format
+      (e.g., +15551234567). Leave blank to auto-claim a DID.
+  PhoneNumberCountryCode:
+    Type: String
+    Default: US
+    AllowedValues:
+      - US
+      - CA
+      - GB
+      - AU
+      - DE
+      - FR
+      - ES
+      - JP
+    Description: >
+      Country code for claiming a new phone number.
+      Only used when SourcePhoneNumber is left blank.
   Environment:
     Type: String
     Default: dev
@@ -22,6 +46,10 @@ Parameters:
       - dev
       - prod
     Description: Deployment environment
+
+Conditions:
+  CreateContactFlow: !Equals [!Ref ConnectContactFlowId, '']
+  ClaimPhoneNumber: !Equals [!Ref SourcePhoneNumber, '']
 
 Resources:
   CallLogTable:
@@ -50,6 +78,70 @@ Resources:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: !Sub 'connect-mcp-sms-${Environment}'
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+  ConnectContactFlow:
+    Condition: CreateContactFlow
+    Type: AWS::Connect::ContactFlow
+    Properties:
+      InstanceId: !Ref ConnectInstanceId
+      Name: !Sub 'OutboundReminder-${Environment}'
+      Type: OUTBOUND_WHISPER
+      Content: |
+        {
+          "Version": "2019-10-30",
+          "StartAction": "SetVoice",
+          "Actions": [
+            {
+              "Identifier": "SetVoice",
+              "Type": "SetVoice",
+              "Parameters": {
+                "GlobalVoice": {
+                  "Language": "en-US",
+                  "Voice": "Joanna"
+                }
+              },
+              "Transitions": {
+                "NextAction": "PlayPrompt"
+              }
+            },
+            {
+              "Identifier": "PlayPrompt",
+              "Type": "MessageParticipant",
+              "Parameters": {
+                "Text": "$.Attributes.ReminderMessage",
+                "TextToSpeechType": "text"
+              },
+              "Transitions": {
+                "NextAction": "Disconnect"
+              }
+            },
+            {
+              "Identifier": "Disconnect",
+              "Type": "DisconnectParticipant",
+              "Parameters": {},
+              "Transitions": {}
+            }
+          ]
+        }
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+  ConnectPhoneNumber:
+    Condition: ClaimPhoneNumber
+    Type: AWS::Connect::PhoneNumber
+    DependsOn: ConnectContactFlow
+    Properties:
+      InstanceId: !Ref ConnectInstanceId
+      PhoneNumberType: DID
+      TargetArn: !If
+        - CreateContactFlow
+        - !GetAtt ConnectContactFlow.Arn
+        - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact-flow/${ConnectContactFlowId}'
+      CountryCode: !Ref PhoneNumberCountryCode
       Tags:
         - Key: Project
           Value: connect-mcp-agent
@@ -109,8 +201,14 @@ Resources:
       Environment:
         Variables:
           CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
-          CONNECT_CONTACT_FLOW_ID: !Ref ConnectContactFlowId
-          SOURCE_PHONE_NUMBER: !Ref SourcePhoneNumber
+          CONNECT_CONTACT_FLOW_ID: !If
+            - CreateContactFlow
+            - !GetAtt ConnectContactFlow.ContactFlowId
+            - !Ref ConnectContactFlowId
+          SOURCE_PHONE_NUMBER: !If
+            - ClaimPhoneNumber
+            - !GetAtt ConnectPhoneNumber.Address
+            - !Ref SourcePhoneNumber
           CALL_LOG_TABLE: !Ref CallLogTable
           SNS_TOPIC_ARN: !Ref SNSTopic
       Code:
@@ -140,7 +238,12 @@ Resources:
               phone = args.get('phone_number')
               message = args.get('message')
               if not phone or not message or not phone.startswith('+'):
-                  return {'statusCode': 400, 'body': json.dumps({'error': 'Missing or invalid phone_number/message. Use E.164 format.'})}
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({
+                          'error': 'Missing or invalid phone_number/message. Use E.164 format.'
+                      })
+                  }
               try:
                   r = connect.start_outbound_contact(
                       DestinationPhoneNumber=phone,
@@ -159,7 +262,14 @@ Resources:
                           'Type': 'call',
                           'ExpiresAt': int((datetime.utcnow() + timedelta(days=30)).timestamp())
                       })
-                  return {'statusCode': 200, 'body': json.dumps({'contact_id': cid, 'status': 'dialing', 'message': f'Call initiated to {phone}'})}
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'contact_id': cid,
+                          'status': 'dialing',
+                          'message': f'Call initiated to {phone}'
+                      })
+                  }
               except Exception as e:
                   return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 
@@ -167,16 +277,29 @@ Resources:
               phone = args.get('phone_number')
               message = args.get('message')
               if not phone or not message:
-                  return {'statusCode': 400, 'body': json.dumps({'error': 'Missing phone_number or message'})}
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': 'Missing phone_number or message'})
+                  }
               try:
                   r = sns.publish(PhoneNumber=phone, Message=message)
-                  return {'statusCode': 200, 'body': json.dumps({'message_id': r['MessageId'], 'status': 'sent', 'message': f'SMS sent to {phone}'})}
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message_id': r['MessageId'],
+                          'status': 'sent',
+                          'message': f'SMS sent to {phone}'
+                      })
+                  }
               except Exception as e:
                   return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
 
           def log_reminder(args):
               if not ddb:
-                  return {'statusCode': 500, 'body': json.dumps({'error': 'DynamoDB not configured'})}
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': 'DynamoDB not configured'})
+                  }
               ddb.Table(os.environ['CALL_LOG_TABLE']).put_item(Item={
                   'ContactId': args.get('contact_id', 'manual-' + str(time.time())),
                   'Timestamp': datetime.utcnow().isoformat(),
@@ -192,7 +315,9 @@ Resources:
 
 Outputs:
   LambdaArn:
-    Description: ARN of the Outbound Call Lambda. Use this when registering your AgentCore Gateway target.
+    Description: >
+      ARN of the Outbound Call Lambda.
+      Use this when registering your AgentCore Gateway target.
     Value: !GetAtt OutboundCallLambda.Arn
     Export:
       Name: !Sub '${AWS::StackName}-LambdaArn'
@@ -206,3 +331,19 @@ Outputs:
     Value: !Ref SNSTopic
     Export:
       Name: !Sub '${AWS::StackName}-SNSTopic'
+  ContactFlowId:
+    Description: >
+      The Contact Flow ID used for outbound calls.
+      Auto-generated if not provided.
+    Value: !If
+      - CreateContactFlow
+      - !GetAtt ConnectContactFlow.ContactFlowId
+      - !Ref ConnectContactFlowId
+  SourcePhoneNumber:
+    Description: >
+      The E.164 phone number used for outbound calls.
+      Auto-claimed if not provided.
+    Value: !If
+      - ClaimPhoneNumber
+      - !GetAtt ConnectPhoneNumber.Address
+      - !Ref SourcePhoneNumber
