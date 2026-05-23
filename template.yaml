@@ -1,0 +1,208 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Amazon Connect MCP Agent - Backend Infrastructure.
+  Deploys a Lambda function, DynamoDB call log table, SNS topic, and IAM role.
+  After deployment, use the Lambda ARN with AgentCore Gateway to expose these
+  actions as MCP tools to your AI agent.
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: Your existing Amazon Connect Instance ID (e.g., 12345678-1234-1234-1234-123456789012)
+  ConnectContactFlowId:
+    Type: String
+    Description: The Outbound Contact Flow ID (UUID from the ARN)
+  SourcePhoneNumber:
+    Type: String
+    Description: Your claimed Amazon Connect outbound number in E.164 format (e.g., +15551234567)
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment environment
+
+Resources:
+  CallLogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'connect-mcp-logs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ContactId
+          AttributeType: S
+        - AttributeName: Timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ContactId
+          KeyType: HASH
+        - AttributeName: Timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ExpiresAt
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'connect-mcp-sms-${Environment}'
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'connect-mcp-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectMCPPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ConnectOutbound
+                Effect: Allow
+                Action:
+                  - connect:StartOutboundContact
+                  - connect:UpdateContactAttributes
+                Resource:
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact/*'
+              - Sid: DynamoDBLog
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt CallLogTable.Arn
+              - Sid: SNSSMS
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    sns:Protocol: sms
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+  OutboundCallLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'connect-outbound-caller-${Environment}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          CONNECT_CONTACT_FLOW_ID: !Ref ConnectContactFlowId
+          SOURCE_PHONE_NUMBER: !Ref SourcePhoneNumber
+          CALL_LOG_TABLE: !Ref CallLogTable
+          SNS_TOPIC_ARN: !Ref SNSTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import time
+          from datetime import datetime, timedelta
+
+          connect = boto3.client('connect')
+          ddb = boto3.resource('dynamodb') if os.getenv('CALL_LOG_TABLE') else None
+          sns = boto3.client('sns') if os.getenv('SNS_TOPIC_ARN') else None
+
+          def handler(event, context):
+              args = event.get('arguments', {})
+              action = args.get('action', 'place_outbound_call')
+              if action == 'place_outbound_call':
+                  return place_outbound_call(args)
+              if action == 'send_sms':
+                  return send_sms(args)
+              if action == 'log':
+                  return log_reminder(args)
+              return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown action'})}
+
+          def place_outbound_call(args):
+              phone = args.get('phone_number')
+              message = args.get('message')
+              if not phone or not message or not phone.startswith('+'):
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'Missing or invalid phone_number/message. Use E.164 format.'})}
+              try:
+                  r = connect.start_outbound_contact(
+                      DestinationPhoneNumber=phone,
+                      ContactFlowId=os.environ['CONNECT_CONTACT_FLOW_ID'],
+                      InstanceId=os.environ['CONNECT_INSTANCE_ID'],
+                      SourcePhoneNumber=os.environ['SOURCE_PHONE_NUMBER'],
+                      Attributes={'ReminderMessage': message}
+                  )
+                  cid = r['ContactId']
+                  if ddb:
+                      ddb.Table(os.environ['CALL_LOG_TABLE']).put_item(Item={
+                          'ContactId': cid,
+                          'Timestamp': datetime.utcnow().isoformat(),
+                          'Phone': phone,
+                          'Message': message,
+                          'Type': 'call',
+                          'ExpiresAt': int((datetime.utcnow() + timedelta(days=30)).timestamp())
+                      })
+                  return {'statusCode': 200, 'body': json.dumps({'contact_id': cid, 'status': 'dialing', 'message': f'Call initiated to {phone}'})}
+              except Exception as e:
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+          def send_sms(args):
+              phone = args.get('phone_number')
+              message = args.get('message')
+              if not phone or not message:
+                  return {'statusCode': 400, 'body': json.dumps({'error': 'Missing phone_number or message'})}
+              try:
+                  r = sns.publish(PhoneNumber=phone, Message=message)
+                  return {'statusCode': 200, 'body': json.dumps({'message_id': r['MessageId'], 'status': 'sent', 'message': f'SMS sent to {phone}'})}
+              except Exception as e:
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+          def log_reminder(args):
+              if not ddb:
+                  return {'statusCode': 500, 'body': json.dumps({'error': 'DynamoDB not configured'})}
+              ddb.Table(os.environ['CALL_LOG_TABLE']).put_item(Item={
+                  'ContactId': args.get('contact_id', 'manual-' + str(time.time())),
+                  'Timestamp': datetime.utcnow().isoformat(),
+                  'Phone': args.get('phone_number', ''),
+                  'Message': args.get('message', ''),
+                  'Type': 'log',
+                  'ExpiresAt': int((datetime.utcnow() + timedelta(days=30)).timestamp())
+              })
+              return {'statusCode': 200, 'body': json.dumps({'status': 'logged'})}
+      Tags:
+        - Key: Project
+          Value: connect-mcp-agent
+
+Outputs:
+  LambdaArn:
+    Description: ARN of the Outbound Call Lambda. Use this when registering your AgentCore Gateway target.
+    Value: !GetAtt OutboundCallLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+  DynamoDBTableName:
+    Description: Call Log Table Name
+    Value: !Ref CallLogTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DynamoDBTable'
+  SNSTopicArn:
+    Description: SNS Topic ARN for SMS reminders
+    Value: !Ref SNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopic'
