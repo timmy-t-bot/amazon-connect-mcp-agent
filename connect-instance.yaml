@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Standalone Amazon Connect instance for MCP Agent integration.
+  Deploy this first if you do not have an existing Connect instance.
+  Then use the output InstanceId when deploying template.yaml.
+
+Parameters:
+  InstanceAlias:
+    Type: String
+    Description: >
+      Globally unique alias for the Connect instance.
+      Alphanumeric and hyphens only, max 45 characters.
+      Example: acme-corp-mcp-agent
+  IdentityManagementType:
+    Type: String
+    Default: CONNECT_MANAGED
+    AllowedValues:
+      - CONNECT_MANAGED
+      - SAML
+    Description: >
+      CONNECT_MANAGED is recommended for simple setup.
+      SAML requires an existing identity provider.
+  InboundCallsEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable inbound calling capability.
+  OutboundCallsEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable outbound calling capability.
+
+Resources:
+  ConnectInstance:
+    Type: AWS::Connect::Instance
+    Properties:
+      IdentityManagementType: !Ref IdentityManagementType
+      InboundCallsEnabled: !Ref InboundCallsEnabled
+      OutboundCallsEnabled: !Ref OutboundCallsEnabled
+      InstanceAlias: !Ref InstanceAlias
+
+Outputs:
+  ConnectInstanceId:
+    Description: >
+      The ID of the created Connect instance.
+      Pass this to template.yaml as the ConnectInstanceId parameter.
+    Value: !Ref ConnectInstance
+  ConnectInstanceArn:
+    Description: The ARN of the created Connect instance.
+    Value: !GetAtt ConnectInstance.Arn
+  NextSteps:
+    Description: Post-deployment instructions.
+    Value: >
+      1. Open the Amazon Connect console.
+      2. Select your new instance and claim an admin user.
+      3. Note the InstanceId output above.
+      4. Deploy template.yaml with ConnectInstanceId set to that value.

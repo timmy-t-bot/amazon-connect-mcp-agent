@@ -50,12 +50,16 @@ By using **Amazon Bedrock AgentCore Gateway**, we expose AWS actions as standard
 ## 3. Prerequisites
 
 - An AWS Account.
-- An **Amazon Connect Instance** (you only need the Instance ID; the template handles the rest).
 - IAM permissions to create Lambda, DynamoDB, SNS, and Connect resources.
 - The [AWS AgentCore CLI](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/gateway-quick-start.html) installed:
   ```bash
   npm install -g @aws/agentcore
   ```
+
+**Note on Amazon Connect instances:**
+- If you already have a Connect instance, you only need its **Instance ID**.
+- If you do not have one, `template.yaml` can create it automatically (see Option A below).
+- Alternatively, deploy `connect-instance.yaml` first to create an instance separately.
 
 ---
 
@@ -63,11 +67,25 @@ By using **Amazon Bedrock AgentCore Gateway**, we expose AWS actions as standard
 
 ### Step 1: Deploy the CloudFormation Template
 
-The template automatically provisions the backend and can optionally create a Connect Contact Flow and claim a phone number for you.
+The template automatically provisions the backend and can optionally create a Connect Instance, Contact Flow, and claimed phone number for you.
 
-**Option A: Fully Automated (Recommended for New Projects)**
+#### Option A: Zero-Touch (No Existing Connect Instance)
 
-Provide only your Connect Instance ID. The template will create a simple outbound reminder flow and claim a DID phone number.
+Provide only a globally unique alias. The template creates the Connect instance, a simple outbound reminder flow, and claims a DID phone number.
+
+```bash
+aws cloudformation deploy \
+  --template-file template.yaml \
+  --stack-name connect-mcp-agent \
+  --parameter-overrides \
+    ConnectInstanceAlias=acme-mcp-agent-dev \
+    Environment=dev \
+  --capabilities CAPABILITY_NAMED_IAM
+```
+
+#### Option B: Use Existing Connect Instance
+
+If you already have an Amazon Connect instance:
 
 ```bash
 aws cloudformation deploy \
@@ -79,9 +97,9 @@ aws cloudformation deploy \
   --capabilities CAPABILITY_NAMED_IAM
 ```
 
-**Option B: Use Existing Flow and Number**
+#### Option C: Use Existing Instance + Existing Flow and Number
 
-If you already have an outbound contact flow and a claimed phone number:
+If you already have an instance, contact flow, and claimed phone number:
 
 ```bash
 aws cloudformation deploy \
@@ -99,12 +117,13 @@ aws cloudformation deploy \
 
 | Resource | Purpose |
 |----------|---------|
+| **Connect Instance** (optional) | Amazon Connect instance with outbound calling enabled. |
+| **Contact Flow** (optional) | A pre-built outbound flow that speaks `$.Attributes.ReminderMessage` via Polly. |
+| **Phone Number** (optional) | A claimed DID associated with the outbound flow. |
 | **Lambda Function** (`connect-outbound-caller`) | Handles `place_outbound_call`, `send_sms`, and `log` actions. |
 | **IAM Role** | Grants least-privilege access to Connect, DynamoDB, SNS, and CloudWatch Logs. |
 | **DynamoDB Table** (`connect-mcp-logs`) | Stores call/SMS logs with a 30-day TTL for automatic cleanup. |
 | **SNS Topic** | Backend for SMS reminders. |
-| **Contact Flow** (optional) | A pre-built outbound flow that speaks `$.Attributes.ReminderMessage` via Polly. |
-| **Phone Number** (optional) | A claimed DID associated with the outbound flow. |
 
 After deployment, grab the outputs:
 
@@ -114,7 +133,7 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs'
 ```
 
-You will need the **LambdaArn**, **ContactFlowId**, and **SourcePhoneNumber** for the next step.
+You will need the **LambdaArn**, **ConnectInstanceId**, **ContactFlowId**, and **SourcePhoneNumber** for the next step.
 
 ### Step 2: Deploy AgentCore Gateway
 

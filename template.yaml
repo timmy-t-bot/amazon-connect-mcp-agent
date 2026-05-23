@@ -2,28 +2,39 @@ AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Amazon Connect MCP Agent - Backend Infrastructure.
   Deploys a Lambda function, DynamoDB call log table, SNS topic, and optionally
-  an Amazon Connect Outbound Contact Flow and claimed phone number.
+  an Amazon Connect Instance, Outbound Contact Flow, and claimed phone number.
   After deployment, use the Lambda ARN with AgentCore Gateway to expose these
   actions as MCP tools to your AI agent.
 
 Parameters:
   ConnectInstanceId:
     Type: String
+    Default: ''
     Description: >
       Your existing Amazon Connect Instance ID
-      (e.g., 12345678-1234-1234-1234-123456789012)
+      (e.g., 12345678-1234-1234-1234-123456789012).
+      Leave blank to create a new Connect instance automatically.
+  ConnectInstanceAlias:
+    Type: String
+    Default: ''
+    Description: >
+      REQUIRED when creating a new Connect instance (ConnectInstanceId is blank).
+      Globally unique alias. Alphanumeric and hyphens only, max 45 chars.
+      Example: acme-mcp-agent-dev
   ConnectContactFlowId:
     Type: String
     Default: ''
     Description: >
       Existing Outbound Contact Flow ID (UUID from the ARN).
       Leave blank to auto-create a simple reminder flow.
+      NOTE: Ignored when creating a new Connect instance.
   SourcePhoneNumber:
     Type: String
     Default: ''
     Description: >
       Your claimed Amazon Connect outbound number in E.164 format
       (e.g., +15551234567). Leave blank to auto-claim a DID.
+      NOTE: Ignored when creating a new Connect instance.
   PhoneNumberCountryCode:
     Type: String
     Default: US
@@ -38,7 +49,7 @@ Parameters:
       - JP
     Description: >
       Country code for claiming a new phone number.
-      Only used when SourcePhoneNumber is left blank.
+      Only used when a phone number is not provided.
   Environment:
     Type: String
     Default: dev
@@ -48,10 +59,24 @@ Parameters:
     Description: Deployment environment
 
 Conditions:
-  CreateContactFlow: !Equals [!Ref ConnectContactFlowId, '']
-  ClaimPhoneNumber: !Equals [!Ref SourcePhoneNumber, '']
+  CreateConnectInstance: !Equals [!Ref ConnectInstanceId, '']
+  CreateContactFlow: !Or
+    - !Condition CreateConnectInstance
+    - !Equals [!Ref ConnectContactFlowId, '']
+  ClaimPhoneNumber: !Or
+    - !Condition CreateConnectInstance
+    - !Equals [!Ref SourcePhoneNumber, '']
 
 Resources:
+  ConnectInstance:
+    Condition: CreateConnectInstance
+    Type: AWS::Connect::Instance
+    Properties:
+      IdentityManagementType: CONNECT_MANAGED
+      InboundCallsEnabled: true
+      OutboundCallsEnabled: true
+      InstanceAlias: !Ref ConnectInstanceAlias
+
   CallLogTable:
     Type: AWS::DynamoDB::Table
     Properties:
@@ -86,7 +111,10 @@ Resources:
     Condition: CreateContactFlow
     Type: AWS::Connect::ContactFlow
     Properties:
-      InstanceId: !Ref ConnectInstanceId
+      InstanceId: !If
+        - CreateConnectInstance
+        - !Ref ConnectInstance
+        - !Ref ConnectInstanceId
       Name: !Sub 'OutboundReminder-${Environment}'
       Type: OUTBOUND_WHISPER
       Content: |
@@ -134,11 +162,14 @@ Resources:
     Condition: ClaimPhoneNumber
     Type: AWS::Connect::PhoneNumber
     Properties:
-      InstanceId: !Ref ConnectInstanceId
+      InstanceId: !If
+        - CreateConnectInstance
+        - !Ref ConnectInstance
+        - !Ref ConnectInstanceId
       PhoneNumberType: DID
       TargetArn: !If
         - CreateContactFlow
-        - !GetAtt ConnectContactFlow.Arn
+        - !Ref ConnectContactFlow
         - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact-flow/${ConnectContactFlowId}'
       CountryCode: !Ref PhoneNumberCountryCode
       Tags:
@@ -169,8 +200,14 @@ Resources:
                   - connect:StartOutboundContact
                   - connect:UpdateContactAttributes
                 Resource:
-                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
-                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact/*'
+                  - !If
+                    - CreateConnectInstance
+                    - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstance}/*'
+                    - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/*'
+                  - !If
+                    - CreateConnectInstance
+                    - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstance}/contact/*'
+                    - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact/*'
               - Sid: DynamoDBLog
                 Effect: Allow
                 Action:
@@ -199,7 +236,10 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          CONNECT_INSTANCE_ID: !Ref ConnectInstanceId
+          CONNECT_INSTANCE_ID: !If
+            - CreateConnectInstance
+            - !Ref ConnectInstance
+            - !Ref ConnectInstanceId
           CONNECT_CONTACT_FLOW_ID: !If
             - CreateContactFlow
             - !Ref ConnectContactFlow
@@ -330,6 +370,13 @@ Outputs:
     Value: !Ref SNSTopic
     Export:
       Name: !Sub '${AWS::StackName}-SNSTopic'
+  ConnectInstanceId:
+    Description: >
+      The Connect Instance ID (existing or auto-created).
+    Value: !If
+      - CreateConnectInstance
+      - !Ref ConnectInstance
+      - !Ref ConnectInstanceId
   ContactFlowId:
     Description: >
       The Contact Flow ID used for outbound calls.
