@@ -73,9 +73,10 @@ Resources:
     Type: AWS::Connect::Instance
     Properties:
       IdentityManagementType: CONNECT_MANAGED
-      InboundCallsEnabled: true
-      OutboundCallsEnabled: true
       InstanceAlias: !Ref ConnectInstanceAlias
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: true
 
   CallLogTable:
     Type: AWS::DynamoDB::Table

@@ -40,9 +40,10 @@ Resources:
     Type: AWS::Connect::Instance
     Properties:
       IdentityManagementType: !Ref IdentityManagementType
-      InboundCallsEnabled: !Ref InboundCallsEnabled
-      OutboundCallsEnabled: !Ref OutboundCallsEnabled
       InstanceAlias: !Ref InstanceAlias
+      Attributes:
+        InboundCalls: !Ref InboundCallsEnabled
+        OutboundCalls: !Ref OutboundCallsEnabled
 
 Outputs:
   ConnectInstanceId:
