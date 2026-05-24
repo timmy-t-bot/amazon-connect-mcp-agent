@@ -27,14 +27,12 @@ Parameters:
     Description: >
       Existing Outbound Contact Flow ID (UUID from the ARN).
       Leave blank to auto-create a simple reminder flow.
-      NOTE: Ignored when creating a new Connect instance.
   SourcePhoneNumber:
     Type: String
     Default: ''
     Description: >
       Your claimed Amazon Connect outbound number in E.164 format
       (e.g., +15551234567). Leave blank to auto-claim a DID.
-      NOTE: Ignored when creating a new Connect instance.
   PhoneNumberCountryCode:
     Type: String
     Default: US
@@ -112,10 +110,10 @@ Resources:
     Condition: CreateContactFlow
     Type: AWS::Connect::ContactFlow
     Properties:
-      InstanceId: !If
+      InstanceArn: !If
         - CreateConnectInstance
-        - !Ref ConnectInstance
-        - !Ref ConnectInstanceId
+        - !GetAtt ConnectInstance.Arn
+        - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
       Name: !Sub 'OutboundReminder-${Environment}'
       Type: OUTBOUND_WHISPER
       Content: |
@@ -163,15 +161,11 @@ Resources:
     Condition: ClaimPhoneNumber
     Type: AWS::Connect::PhoneNumber
     Properties:
-      InstanceId: !If
-        - CreateConnectInstance
-        - !Ref ConnectInstance
-        - !Ref ConnectInstanceId
-      PhoneNumberType: DID
       TargetArn: !If
-        - CreateContactFlow
-        - !Ref ConnectContactFlow
-        - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}/contact-flow/${ConnectContactFlowId}'
+        - CreateConnectInstance
+        - !GetAtt ConnectInstance.Arn
+        - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+      Type: DID
       CountryCode: !Ref PhoneNumberCountryCode
       Tags:
         - Key: Project
@@ -243,7 +237,7 @@ Resources:
             - !Ref ConnectInstanceId
           CONNECT_CONTACT_FLOW_ID: !If
             - CreateContactFlow
-            - !Ref ConnectContactFlow
+            - !GetAtt ConnectContactFlow.ContactFlowArn
             - !Ref ConnectContactFlowId
           SOURCE_PHONE_NUMBER: !If
             - ClaimPhoneNumber
@@ -274,6 +268,9 @@ Resources:
                   return log_reminder(args)
               return {'statusCode': 400, 'body': json.dumps({'error': 'Unknown action'})}
 
+          def extract_id(value):
+              return value.split('/')[-1] if value.startswith('arn:') else value
+
           def place_outbound_call(args):
               phone = args.get('phone_number')
               message = args.get('message')
@@ -287,7 +284,7 @@ Resources:
               try:
                   r = connect.start_outbound_contact(
                       DestinationPhoneNumber=phone,
-                      ContactFlowId=os.environ['CONNECT_CONTACT_FLOW_ID'],
+                      ContactFlowId=extract_id(os.environ['CONNECT_CONTACT_FLOW_ID']),
                       InstanceId=os.environ['CONNECT_INSTANCE_ID'],
                       SourcePhoneNumber=os.environ['SOURCE_PHONE_NUMBER'],
                       Attributes={'ReminderMessage': message}
@@ -378,13 +375,13 @@ Outputs:
       - CreateConnectInstance
       - !Ref ConnectInstance
       - !Ref ConnectInstanceId
-  ContactFlowId:
+  ContactFlowArn:
     Description: >
-      The Contact Flow ID used for outbound calls.
+      The Contact Flow ARN used for outbound calls.
       Auto-generated if not provided.
     Value: !If
       - CreateContactFlow
-      - !Ref ConnectContactFlow
+      - !GetAtt ConnectContactFlow.ContactFlowArn
       - !Ref ConnectContactFlowId
   SourcePhoneNumber:
     Description: >
